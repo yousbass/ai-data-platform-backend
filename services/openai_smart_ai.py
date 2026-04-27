@@ -234,6 +234,13 @@ Your tasks:
 7. Identify map-readiness only if location/geo columns exist.
 8. Identify data quality or design flags when a dashboard is weak, repetitive, or misleading.
 
+CRITICAL DECISION RULE — `keep_as_card`:
+- `keep_as_card` is ONLY valid for KPIs with formula_type ∈ {sum, average, min, max, count_rows, count_non_null, count_distinct}.
+- For any KPI whose formula_type starts with `group_` (group_sum, group_average, group_count) or is `heatmap` / `histogram` /
+  `scatter`, you MUST choose one of: `primary`, `secondary`, `convert_to_table`. These ARE charts.
+- Returning `keep_as_card` on a group-by KPI is a hard error — those KPIs ARE the dashboard's charts.
+- Do not `hide` more than 1 group-by KPI. The dashboard needs at least 5 visible charts to be useful.
+
 Dashboard flow:
 A good dashboard usually moves: Executive Overview → Trend → Breakdown → Detail/Exceptions → Data Quality/Notes.
 Adapt this flow to the dataset domain.
@@ -460,18 +467,141 @@ Important output rules:
     return data
 
 
-def get_kpi_dashboard_suggestions(metadata: dict) -> dict:
+def _build_required_chart_coverage(metadata: dict) -> str:
+    """
+    Inspect the enriched metadata and emit a deterministic checklist of charts
+    the AI MUST produce when the supporting columns exist. This stops the model
+    from returning a wall of card-only KPIs when the dataset clearly supports
+    breakdowns (color popularity, brand × month, date-update cohort, etc.).
+    """
+    columns = {str(c.get("name", "")): c for c in (metadata.get("columns") or [])}
+    column_names = set(columns.keys())
+    hints = metadata.get("analysis_hints") or {}
+    multi_value_names = {mv.get("name") for mv in hints.get("multi_value_columns") or []}
+
+    def has(name: str) -> bool:
+        return name in column_names
+
+    def has_any(*names: str) -> str | None:
+        for n in names:
+            if n in column_names:
+                return n
+        return None
+
+    requirements: list[str] = []
+
+    color_dim = has_any("colors_primary", "color", "colors")
+    if color_dim:
+        requirements.append(
+            f'- Color popularity: group_count over `{color_dim}` as a horizontal_bar_chart, top 10. '
+            f'Name it "Top Colors by Listing Count".'
+        )
+
+    brand_dim = has_any("brand_normalized", "brand", "manufacturer")
+    if brand_dim:
+        requirements.append(
+            f'- Top brands: group_count over `{brand_dim}` as a horizontal_bar_chart, top 15. '
+            f'Name it "Top Brands by Listing Count".'
+        )
+
+    category_dim = has_any("categories_primary", "category", "categories")
+    if category_dim:
+        requirements.append(
+            f'- Top categories: group_count over `{category_dim}` as a horizontal_bar_chart, top 12. '
+            f'Name it "Top Categories by Listing Count".'
+        )
+
+    merchant_dim = has_any("merchant_normalized", "merchant", "merchants_primary", "merchants")
+    if merchant_dim:
+        requirements.append(
+            f'- Listings by merchant: group_count over `{merchant_dim}` as a horizontal_bar_chart, top 12.'
+        )
+
+    price_value = has_any("price_midpoint", "price_amount_min", "price_amount_max", "price")
+    if brand_dim and price_value:
+        requirements.append(
+            f'- Avg price by brand: group_average of `{price_value}` over `{brand_dim}` as a horizontal_bar_chart, '
+            f'top 15. Name it "Average Price by Brand".'
+        )
+    if category_dim and price_value:
+        requirements.append(
+            f'- Avg price by category: group_average of `{price_value}` over `{category_dim}` as a bar_chart, '
+            f'top 12. Name it "Average Price by Category".'
+        )
+
+    if has("price_tier") and price_value:
+        requirements.append(
+            '- Listings per price tier: group_count over `price_tier` as a bar_chart. '
+            'Name it "Listings by Price Tier" (ordering: Under $25 → $25-50 → $50-100 → ... → $1000+).'
+        )
+
+    bucket_cols = [name for name in column_names if name.endswith("_bucket")]
+    if bucket_cols:
+        bucket = bucket_cols[0]
+        requirements.append(
+            f'- Date-cohort distribution: group_count over `{bucket}` as a bar_chart. '
+            f'This answers "how stale / how-recently-updated is the catalog".'
+        )
+
+    # Brand × month / date-time series. Use brand_dim grouped over a month derived col.
+    month_col = has_any("product_added_month", "price_seen_month", "added_month")
+    if brand_dim and month_col:
+        requirements.append(
+            f'- Brand activity over time: heatmap with x=`{month_col}`, y=`{brand_dim}`, '
+            f'value_column=count. Name it "Brand Activity by Month" (heatmap formula_type).'
+        )
+    if month_col:
+        requirements.append(
+            f'- Listings added over time: group_count over `{month_col}` as a line_chart. '
+            f'Name it "Listings Added Over Time".'
+        )
+
+    sale_flag = has_any("is_sale_flag", "is_sale")
+    if sale_flag and brand_dim:
+        requirements.append(
+            f'- Promo intensity by brand: group_average of `{sale_flag}` over `{brand_dim}` as a horizontal_bar_chart, '
+            f'top 15. Name it "On-Sale Share by Brand".'
+        )
+
+    if not requirements:
+        return ""
+
+    return (
+        "\n## REQUIRED CHART COVERAGE (deterministic, based on actual columns in this dataset)\n\n"
+        "You MUST include every item below in your `kpis` array — these become the dashboard's CHARTS. "
+        "If you skip one, you have failed the brief.\n\n"
+        + "\n".join(requirements)
+        + "\n\nMINIMUM: at least 5 group_* / heatmap KPIs (charts). Cards alone are a failure.\n"
+    )
+
+
+def get_kpi_dashboard_suggestions(metadata: dict, force_charts: bool = False) -> dict:
     """
     Smart AI #2: KPI and Dashboard Strategy AI.
 
     Receives enriched safe metadata and returns:
     - kpis
     - dashboard_layout
+
+    When force_charts=True, the prompt is hardened to insist on group-by KPIs. Used
+    for retries when the first attempt returned only headline cards.
     """
     analyst_instructions = _load_prompt_file(
         "02_kpi_strategy_consultant_prompt.md",
         KPI_DASHBOARD_ANALYST_INSTRUCTIONS,
     )
+    required_coverage = _build_required_chart_coverage(metadata)
+    force_block = ""
+    if force_charts:
+        force_block = (
+            "\n## CRITICAL — RETRY MODE\n"
+            "Your previous response contained ZERO group-by KPIs. The dashboard rendered "
+            "as a wall of cards with no comparisons. This is a failure.\n"
+            "You MUST now include at least 6 KPIs whose `formula_type` is one of: "
+            "`group_count`, `group_sum`, `group_average`, `heatmap`. These are the charts.\n"
+            "Do NOT propose more scalar `count_distinct` / `average` KPIs in this retry — "
+            "we already have the headline cards.\n"
+        )
     prompt = f"""
 {analyst_instructions}
 
@@ -524,6 +654,18 @@ Pick the type that respects the data:
 - Cap line_chart to ≤2 unless trend analysis is the dataset's explicit purpose.
 - Use ranking_table for "top-N" questions with named items (products, merchants, customers).
 
+DASHBOARD-WIDE QUALITY BAR (MANDATORY):
+- A "professional" dashboard means: 4-8 headline KPI cards PLUS at least 5 charts (group_*, heatmap).
+- Cards alone are NOT a dashboard. If you only emit scalar `count_distinct`/`average`/`sum` KPIs, you have failed.
+- Group-by KPIs become the dashboard's charts. Each one must use a real dimension column from the metadata.
+- Prefer dimensions that already exist in the data: `*_primary` (multi-value explosions), `*_bucket` (cohort/recency/tier),
+  `brand_normalized`, `merchant_normalized`, `categories_primary`, `colors_primary`, plus any `*_month` / `*_year` derived columns.
+
+CROSS-DIMENSIONAL CHARTS (use formula_type=heatmap):
+- When a brand dimension and a month derived column both exist, propose at least one heatmap with
+  x_column=month, y_column=brand, value_column=count. This shows brand activity over time.
+- When a category dimension and a month/year column both exist, the same applies for category-over-time.
+{required_coverage}{force_block}
 Safe enriched metadata:
 {json.dumps(metadata, indent=2, ensure_ascii=False)}
 
