@@ -496,11 +496,33 @@ Supported formula_type values:
 - group_average: requires "group_by" and "value_column".
 - group_count: requires "group_by".
 
-Supported visual values:
-- kpi_card
-- line_chart
-- bar_chart
-- table
+Supported visual values (use the chart type that best fits the data shape — the full set is intentionally broad):
+- kpi_card           — single headline numbers
+- line_chart         — time-ordered trend (≤2 per dashboard unless trend is the dataset's purpose)
+- area_chart         — emphasised trend / cumulative growth
+- bar_chart          — categorical comparison, ≤12 categories
+- horizontal_bar_chart — long-label rankings or top-N (≥6 categories)
+- column_chart       — same as bar but vertical for short labels
+- pie_chart          — share of total, ≤5 slices, top_share_pct ≥ 25%
+- donut_chart        — share of total with a centre KPI, ≤6 slices
+- stacked_bar_chart  — composition over a dimension
+- scatter_plot       — correlation between two measures
+- bubble_chart       — correlation with a third measure encoding size
+- histogram          — distribution of a single measure
+- box_plot           — distribution by category
+- heatmap            — two-dimensional density (e.g. day × hour)
+- treemap            — hierarchical share-of-total
+- funnel_chart       — sequential conversion stages
+- gauge              — KPI with a target / threshold
+- table              — long detail listings
+- ranking_table      — top-N with rank + magnitude (preferred over pie when categories > 5)
+- map_choropleth     — only when a geo column exists
+- map_points         — only when latitude/longitude columns exist
+
+Pick the type that respects the data:
+- If a dimension has > 6 unique categories, do NOT use pie/donut — prefer bar / horizontal_bar / treemap / ranking_table.
+- Cap line_chart to ≤2 unless trend analysis is the dataset's explicit purpose.
+- Use ranking_table for "top-N" questions with named items (products, merchants, customers).
 
 Safe enriched metadata:
 {json.dumps(metadata, indent=2, ensure_ascii=False)}
@@ -514,7 +536,7 @@ Return JSON using exactly this structure:
       "column": "column name if needed",
       "group_by": "grouping column if needed",
       "value_column": "value column if needed",
-      "visual": "kpi_card | line_chart | bar_chart | table",
+      "visual": "one of the supported visual values listed above",
       "priority": "high | medium | low",
       "reason": "short reason"
     }}
@@ -639,7 +661,7 @@ def generate_business_report(report_summary: dict) -> str:
     business report in Markdown format. It must not ask for or invent raw data.
     """
     report_instructions = _load_prompt_file(
-        "04_business_report_writer_prompt.md",
+        "05_business_report_writer_prompt.md",
         REPORT_ANALYST_INSTRUCTIONS,
     )
     prompt = f"""
@@ -671,3 +693,102 @@ Write the report using these sections:
 9. Suggested Next Actions
 """
     return _call_openai_text(prompt)
+
+
+# ---------------------------------------------------------------------------
+# Smart AI #4 — Dashboard Insight Writer
+# ---------------------------------------------------------------------------
+
+INSIGHT_WRITER_INSTRUCTIONS = """
+You are Smart AI #4: Senior Dashboard Insight Writer.
+
+You receive ONLY an aggregated payload — KPI values, top/bottom items per chart, and
+precomputed summary_stats. You never see raw rows.
+
+Write a strict-JSON output containing:
+- a one-sentence headline_summary (≤22 words, includes ≥1 specific number),
+- 4–7 numbered insights, each tied to a specific chart and a specific number,
+- 3–5 strategic recommendations linked to insights via linked_insight_ids,
+- a 3–5 paragraph data_story narrative,
+- 0–4 dashboard_callouts pointing at specific charts.
+
+Every number you emit must appear in the input. No causal claims. No invented columns,
+charts, or KPI names. Tone: confident, calm, executive — no emojis, no exclamations.
+""".strip()
+
+
+def generate_dashboard_insights(insight_payload: dict) -> dict:
+    """
+    Smart AI #4: Dashboard Insight Writer.
+
+    Receives an aggregated insight payload (built by services/insight_engine.py) and
+    returns headline summary, insights, strategic recommendations, narrative, and
+    dashboard callouts. Never sees raw rows.
+    """
+    instructions = _load_prompt_file(
+        "04_dashboard_insight_writer_prompt.md",
+        INSIGHT_WRITER_INSTRUCTIONS,
+    )
+    prompt = f"""
+{instructions}
+
+You receive ONLY this aggregated payload (no raw rows):
+{json.dumps(insight_payload, indent=2, ensure_ascii=False, default=str)}
+
+Return strict JSON using exactly this structure (no markdown fences, no commentary):
+{{
+  "headline_summary": "string (≤22 words, includes ≥1 specific number from the payload)",
+  "insights": [
+    {{
+      "id": "ins_001",
+      "title": "Short title (≤10 words)",
+      "body": "1–2 sentence insight with a specific number and a comparison or rank.",
+      "supporting_chart_ids": ["chart_id from payload.chart_summaries"],
+      "supporting_kpi_names": ["kpi name from payload.kpi_values"],
+      "magnitude_words": ["dominant | leading | growing | declining | stable | concentrated | dispersed | seasonal | recovering | underperforming"],
+      "confidence": 0.0
+    }}
+  ],
+  "strategic_recommendations": [
+    {{
+      "id": "rec_001",
+      "title": "Short imperative (≤12 words, starts with a verb)",
+      "body": "Why and how, grounded in 1–2 specific insights.",
+      "linked_insight_ids": ["ins_001"],
+      "effort": "low | medium | high",
+      "expected_impact": "low | medium | high",
+      "confidence": 0.0
+    }}
+  ],
+  "data_story": [
+    "Paragraph 1 — the hook.",
+    "Paragraph 2 — the most interesting trend.",
+    "Paragraph 3 — the segment or product story.",
+    "Paragraph 4 — the implication / what to do next."
+  ],
+  "dashboard_callouts": [
+    {{
+      "chart_id": "chart_id from payload",
+      "label": "Streak | Anomaly | Watch | Note",
+      "text": "≤18 words pointing at a specific value or shape on this chart."
+    }}
+  ],
+  "coverage_notes": {{
+    "kpis_used": ["kpi names referenced"],
+    "charts_used": ["chart_ids referenced"],
+    "skipped_with_reason": [
+      {{"id": "chart_id", "reason": "short reason"}}
+    ]
+  }}
+}}
+
+Caps: insights ≤7, strategic_recommendations ≤5, data_story ≤5 paragraphs, dashboard_callouts ≤4.
+"""
+    data = _call_openai_json(prompt)
+    data.setdefault("headline_summary", "")
+    data.setdefault("insights", [])
+    data.setdefault("strategic_recommendations", [])
+    data.setdefault("data_story", [])
+    data.setdefault("dashboard_callouts", [])
+    data.setdefault("coverage_notes", {})
+    return data
