@@ -4,13 +4,47 @@ from typing import Any
 
 import pandas as pd
 
+from services.temporal_engine import (
+    ALL_GRAINS,
+    aggregate_by_grain,
+    build_data_by_grain,
+    build_temporal_manifest,
+    detect_date_columns,
+    pick_primary_date_column,
+)
+
 
 DEFAULT_TOP_N = 20
+
+# KPI cards built from these formula types are date-sensitive: when the user
+# changes the global time scope, the headline number should recompute. Each
+# entry maps the formula_type to its `temporal_type` (how the browser should
+# combine the per-bucket values for an arbitrary date range).
+TEMPORAL_CARD_FORMULAS: dict[str, str] = {
+    "sum": "sum",
+    "average": "average",
+    "min": "min",
+    "max": "max",
+    "count_rows": "sum",
+    "count_non_null": "sum",
+    "count_distinct": "distinct_unsupported",  # cannot recompute distincts from buckets
+}
+
+# For a time-scope-aware card we pre-aggregate at these grains. Day buckets
+# would balloon the payload for multi-year datasets and are rarely needed for
+# headline KPIs (the frontend slider snaps to month). Day buckets are still
+# emitted for *charts* via `data_by_grain` so the user can drill in visually.
+CARD_SERIES_GRAINS: tuple[str, ...] = ("month", "year")
 
 
 def _clean_label(value: Any) -> str:
     if pd.isna(value):
         return "Missing"
+    # datetime-like values would otherwise stringify as "2026-04-27 00:00:00"
+    # which is noisy in non-temporal grouping contexts. We still preserve the
+    # date in YYYY-MM-DD form so non-primary date columns don't render junk.
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
     return str(value)
 
 
@@ -40,12 +74,36 @@ def _limit_grouped(grouped: pd.DataFrame, sort_column: str, visual: str | None, 
     return grouped
 
 
-def _add_card(results: dict, name: str, value: Any, value_format: str = "number") -> None:
-    results["kpi_cards"].append({
+def _add_card(
+    results: dict,
+    name: str,
+    value: Any,
+    value_format: str = "number",
+    *,
+    temporal_type: str | None = None,
+    series_by_grain: dict[str, list[dict[str, Any]]] | None = None,
+    value_column: str | None = None,
+) -> None:
+    """
+    Append a KPI card. When `temporal_type` and `series_by_grain` are
+    supplied, the frontend can recompute the card's value for any date range
+    by aggregating the per-bucket series client-side.
+    """
+    card: dict[str, Any] = {
         "title": name,
         "value": value,
         "format": value_format,
-    })
+    }
+    if temporal_type is not None:
+        card["temporal_type"] = temporal_type
+    if series_by_grain is not None:
+        # Drop empty grains to keep the payload tight.
+        non_empty = {grain: rows for grain, rows in series_by_grain.items() if rows}
+        if non_empty:
+            card["series_by_grain"] = non_empty
+            if value_column:
+                card["value_column"] = value_column
+    results["kpi_cards"].append(card)
 
 
 def _add_chart_result(results: dict, name: str, records: list[dict[str, Any]], chart_meta: dict[str, Any]) -> None:
@@ -175,7 +233,24 @@ def calculate_kpis(df: pd.DataFrame, suggestions: dict):
         "grouped_results": {},
         "chart_metadata": {},
         "future_opportunities": suggestions.get("future_opportunities", []),
+        "data_by_grain": {},
+        "temporal_manifest": None,
     }
+
+    # ---- Temporal preflight ----------------------------------------------
+    # Detect date columns *now* so every KPI loop iteration can decide
+    # whether it is operating on the dashboard's anchor date column. The
+    # actual primary-column choice is informed by the AI's chart x-axis
+    # picks, so we collect those first.
+    chart_x_fields: list[str] = []
+    for kpi in suggestions.get("kpis", []):
+        gb = kpi.get("group_by")
+        if isinstance(gb, str):
+            chart_x_fields.append(gb)
+    date_columns = detect_date_columns(df)
+    primary_date_column = pick_primary_date_column(df, date_columns, chart_x_fields)
+    temporal_manifest = build_temporal_manifest(df, primary_date_column, date_columns)
+    results["temporal_manifest"] = temporal_manifest
 
     for kpi in suggestions.get("kpis", []):
         f = kpi.get("formula_type")
@@ -183,38 +258,97 @@ def calculate_kpis(df: pd.DataFrame, suggestions: dict):
         visual = kpi.get("visual") or kpi.get("chart_type") or "kpi_card"
         top_n = int(kpi.get("top_n") or kpi.get("limit") or DEFAULT_TOP_N)
 
+        # Helper closure: build per-grain card series for time-sensitive KPIs.
+        # Returns (temporal_type, series_by_grain) or (None, None).
+        def _card_temporal(formula: str, value_col: str | None) -> tuple[str | None, dict | None]:
+            ttype = TEMPORAL_CARD_FORMULAS.get(formula)
+            if not ttype or ttype == "distinct_unsupported":
+                return None, None
+            if not primary_date_column:
+                return None, None
+            # `count_rows` has no value column — bucket by row count.
+            # `count_non_null` needs the dedicated per-bucket non-null count
+            # (NOT a sum of values — that would compute the wrong KPI).
+            agg = "count" if formula == "count_rows" else (
+                "count_non_null" if formula == "count_non_null" else
+                "sum" if formula == "sum" else
+                "average" if formula == "average" else
+                formula  # min / max
+            )
+            col = None if formula == "count_rows" else value_col
+            if formula != "count_rows" and (not col or col not in df.columns):
+                return None, None
+            series = {
+                grain: aggregate_by_grain(df, primary_date_column, col, agg, grain)
+                for grain in CARD_SERIES_GRAINS
+            }
+            if not any(series.values()):
+                return None, None
+            return ttype, series
+
         try:
             if f == "sum":
                 column = kpi.get("column")
                 if column in df.columns:
-                    _add_card(results, name, float(_numeric_series(df, column).sum()), kpi.get("format", "number"))
+                    ttype, series = _card_temporal(f, column)
+                    _add_card(
+                        results, name, float(_numeric_series(df, column).sum()),
+                        kpi.get("format", "number"),
+                        temporal_type=ttype, series_by_grain=series, value_column=column,
+                    )
 
             elif f == "average":
                 column = kpi.get("column")
                 if column in df.columns:
-                    _add_card(results, name, float(_numeric_series(df, column).mean()), kpi.get("format", "number"))
+                    ttype, series = _card_temporal(f, column)
+                    _add_card(
+                        results, name, float(_numeric_series(df, column).mean()),
+                        kpi.get("format", "number"),
+                        temporal_type=ttype, series_by_grain=series, value_column=column,
+                    )
 
             elif f == "min":
                 column = kpi.get("column")
                 if column in df.columns:
-                    _add_card(results, name, float(_numeric_series(df, column).min()), kpi.get("format", "number"))
+                    ttype, series = _card_temporal(f, column)
+                    _add_card(
+                        results, name, float(_numeric_series(df, column).min()),
+                        kpi.get("format", "number"),
+                        temporal_type=ttype, series_by_grain=series, value_column=column,
+                    )
 
             elif f == "max":
                 column = kpi.get("column")
                 if column in df.columns:
-                    _add_card(results, name, float(_numeric_series(df, column).max()), kpi.get("format", "number"))
+                    ttype, series = _card_temporal(f, column)
+                    _add_card(
+                        results, name, float(_numeric_series(df, column).max()),
+                        kpi.get("format", "number"),
+                        temporal_type=ttype, series_by_grain=series, value_column=column,
+                    )
 
             elif f == "count_rows":
-                _add_card(results, name, int(len(df)), "number")
+                ttype, series = _card_temporal(f, None)
+                _add_card(
+                    results, name, int(len(df)), "number",
+                    temporal_type=ttype, series_by_grain=series,
+                )
 
             elif f == "count_non_null":
                 column = kpi.get("column")
                 if column in df.columns:
-                    _add_card(results, name, int(df[column].notna().sum()), "number")
+                    ttype, series = _card_temporal(f, column)
+                    _add_card(
+                        results, name, int(df[column].notna().sum()), "number",
+                        temporal_type=ttype, series_by_grain=series, value_column=column,
+                    )
 
             elif f == "count_distinct":
                 column = kpi.get("column")
                 if column in df.columns:
+                    # Distinct counts cannot be combined from per-bucket pre-aggregations
+                    # (you would over-count repeats), so we deliberately do NOT expose a
+                    # series_by_grain here. The card stays as a global figure.
                     _add_card(results, name, int(df[column].nunique(dropna=True)), "number")
 
             elif f in ["group_sum", "group_average", "group_median", "group_min", "group_max"]:
@@ -229,12 +363,24 @@ def calculate_kpis(df: pd.DataFrame, suggestions: dict):
                 }
                 if group_by in df.columns and value_column in df.columns:
                     records, meta = _group_numeric(df, group_by, value_column, agg_map[f], visual, top_n)
+                    # Time-series chart: anchor on the primary date column. Emit
+                    # data_by_grain so the frontend can flip between Day/Month/Year.
+                    if primary_date_column and group_by == primary_date_column:
+                        results["data_by_grain"][name] = build_data_by_grain(
+                            df, primary_date_column, value_column, agg_map[f],
+                        )
+                        meta["is_temporal"] = True
                     _add_chart_result(results, name, records, meta)
 
             elif f == "group_count":
                 group_by = kpi.get("group_by")
                 if group_by in df.columns:
                     records, meta = _group_count(df, group_by, visual, top_n)
+                    if primary_date_column and group_by == primary_date_column:
+                        results["data_by_grain"][name] = build_data_by_grain(
+                            df, primary_date_column, None, "count",
+                        )
+                        meta["is_temporal"] = True
                     _add_chart_result(results, name, records, meta)
 
             elif f == "histogram":
