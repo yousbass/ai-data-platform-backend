@@ -5,7 +5,10 @@ Insight Engine — builds the aggregated payload for the Dashboard Insight Write
 Privacy guarantee:
   This module is the *only* path between local row-level data and the Insight Writer
   prompt. It deliberately summarises every chart series into top-N items, bottom-N
-  items, and precomputed summary_stats. It never sends raw rows to the model.
+  items, and precomputed summary_stats. It NEVER sends raw rows or row-level data
+  to the model — chart types whose payloads are inherently row-level (scatter,
+  bubble, heatmap point clouds, raw tables) are explicitly excluded from the payload
+  and replaced with their precomputed summary_stats only.
 """
 from __future__ import annotations
 
@@ -16,6 +19,23 @@ import math
 
 _MAX_TOP_ITEMS = 7
 _MAX_BOTTOM_ITEMS = 3
+
+# Chart types whose .data payload is row-level (one row = one observation rather
+# than one aggregated category). Sending top/bottom items from these would leak
+# raw row values into the model. We summarise them with stats only.
+_ROW_LEVEL_CHART_TYPES: frozenset[str] = frozenset({
+    "scatter", "scatter_plot", "bubble", "bubble_chart",
+    "heatmap_points", "table_raw", "raw_table",
+})
+
+# Hard limits on the validator
+_MAX_INSIGHTS = 7
+_MIN_INSIGHTS = 3
+_MAX_RECS = 5
+_MIN_RECS = 2
+_MAX_STORY_PARAGRAPHS = 5
+_MAX_CALLOUTS = 4
+_HEADLINE_WORD_CAP = 22
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +101,11 @@ def _summary_stats(rows: list[dict], y_field: str) -> dict[str, Any]:
     return stats
 
 
+def _is_row_level_chart(chart: dict[str, Any]) -> bool:
+    t = (chart.get("type") or chart.get("visual") or "").strip().lower()
+    return t in _ROW_LEVEL_CHART_TYPES
+
+
 def _summarise_chart(chart: dict[str, Any], chart_index: int) -> dict[str, Any] | None:
     rows = chart.get("data") or []
     if not rows:
@@ -91,13 +116,39 @@ def _summarise_chart(chart: dict[str, Any], chart_index: int) -> dict[str, Any] 
     if not x_field or not y_field:
         return None
 
+    chart_type = chart.get("type") or chart.get("visual")
+    summary: dict[str, Any] = {
+        "chart_id": chart.get("id") or f"ch_{chart_index + 1:03d}",
+        "title": chart.get("title", f"Chart {chart_index + 1}"),
+        "chart_type": chart_type,
+        "x_field": x_field,
+        "y_field": y_field,
+        "row_count": len(rows),
+        "summary_stats": _summary_stats(rows, y_field),
+    }
+
+    # PRIVACY: row-level visualisations get stats-only — no top/bottom items because
+    # those would expose individual observations to the model.
+    if _is_row_level_chart(chart):
+        summary["top_items"] = []
+        summary["bottom_items"] = []
+        summary["row_level"] = True
+        summary["note"] = (
+            "row-level visual: per-point items withheld for privacy; "
+            "rely on summary_stats only"
+        )
+        return summary
+
     numeric_rows = [
         {"label": r.get(x_field), "value": _safe_float(r.get(y_field))}
         for r in rows
         if _safe_float(r.get(y_field)) is not None
     ]
     if not numeric_rows:
-        return None
+        # Still useful — return stats-only summary
+        summary["top_items"] = []
+        summary["bottom_items"] = []
+        return summary
 
     sorted_desc = sorted(numeric_rows, key=lambda r: r["value"] or 0, reverse=True)
     sorted_asc = list(reversed(sorted_desc))
@@ -112,17 +163,9 @@ def _summarise_chart(chart: dict[str, Any], chart_index: int) -> dict[str, Any] 
         if r not in sorted_desc[:_MAX_TOP_ITEMS]
     ]
 
-    return {
-        "chart_id": chart.get("id") or f"ch_{chart_index + 1:03d}",
-        "title": chart.get("title", f"Chart {chart_index + 1}"),
-        "chart_type": chart.get("type") or chart.get("visual"),
-        "x_field": x_field,
-        "y_field": y_field,
-        "row_count": len(rows),
-        "top_items": top_items,
-        "bottom_items": bottom_items,
-        "summary_stats": _summary_stats(rows, y_field),
-    }
+    summary["top_items"] = top_items
+    summary["bottom_items"] = bottom_items
+    return summary
 
 
 def _summarise_kpis(kpi_cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -196,48 +239,71 @@ def _extract_numbers_from_text(text: str) -> set[str]:
 def _grounding_universe(payload: dict[str, Any]) -> set[str]:
     """All numeric tokens the writer is allowed to use, derived from the payload."""
     numbers: set[str] = set()
+
+    def _add(v: Any) -> None:
+        f = _safe_float(v)
+        if f is None:
+            return
+        numbers.add(f"{round(f, 2)}")
+        numbers.add(f"{round(f, 1)}")
+        if float(f).is_integer():
+            numbers.add(f"{int(f)}")
+
     for card in payload.get("kpi_values", []):
-        v = card.get("value")
-        if isinstance(v, (int, float)):
-            numbers.add(f"{round(v, 2)}")
-            numbers.add(f"{int(v)}" if float(v).is_integer() else f"{round(v, 1)}")
+        _add(card.get("value"))
         cmp = card.get("comparison") or {}
-        for k, val in cmp.items():
-            if isinstance(val, (int, float)):
-                numbers.add(f"{round(val, 2)}")
-                numbers.add(f"{round(val, 1)}")
+        if isinstance(cmp, dict):
+            for v in cmp.values():
+                _add(v)
 
     for chart in payload.get("chart_summaries", []):
-        for item in chart.get("top_items", []) + chart.get("bottom_items", []):
-            v = item.get("value")
-            if isinstance(v, (int, float)):
-                numbers.add(f"{round(v, 2)}")
-                numbers.add(f"{int(v)}" if float(v).is_integer() else f"{round(v, 1)}")
+        for item in (chart.get("top_items") or []) + (chart.get("bottom_items") or []):
+            _add(item.get("value"))
         stats = chart.get("summary_stats", {}) or {}
         for v in stats.values():
-            if isinstance(v, (int, float)):
-                numbers.add(f"{round(v, 2)}")
-                numbers.add(f"{round(v, 1)}")
-                numbers.add(f"{int(v)}" if float(v).is_integer() else f"{round(v, 1)}")
+            _add(v)
 
     # Allow trivial small integers (years, ranks, counts) without flagging
-    for n in range(0, 50):
+    for n in range(0, 100):
         numbers.add(str(n))
     for year in range(1990, 2050):
         numbers.add(str(year))
     return numbers
 
 
+def _ungrounded_numbers(text: str, grounding: set[str]) -> list[str]:
+    found = _extract_numbers_from_text(text)
+    return [n for n in found if n not in grounding]
+
+
 def validate_insight_output(
     output: dict[str, Any], payload: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Validate the Insight Writer output. Returns (cleaned_output, validation_log)."""
+    """
+    Validate the Insight Writer output. Returns (cleaned_output, validation_log).
+
+    Hard failures (added to log["errors"]; the caller may choose to re-prompt):
+      - output is not a dict
+      - fewer than _MIN_INSIGHTS valid insights
+      - fewer than _MIN_RECS strategic_recommendations
+      - any insight references a chart_id or kpi_name that does not exist in payload
+      - any recommendation links to a non-existent insight id
+
+    Soft warnings (added to log["warnings"]; not a re-prompt trigger):
+      - headline > word cap
+      - ungrounded numbers in body / headline / recs / story / callouts
+      - lists truncated to caps
+    """
     log: dict[str, Any] = {"errors": [], "warnings": [], "removed": []}
     if not isinstance(output, dict):
-        return {"headline_summary": "", "insights": [], "strategic_recommendations": [],
-                "data_story": [], "dashboard_callouts": []}, {
-            "errors": ["output is not a dict"], "warnings": [], "removed": []
-        }
+        log["errors"].append("output is not a dict")
+        return {
+            "headline_summary": "",
+            "insights": [],
+            "strategic_recommendations": [],
+            "data_story": [],
+            "dashboard_callouts": [],
+        }, log
 
     valid_chart_ids = {c["chart_id"] for c in payload.get("chart_summaries", [])}
     valid_kpi_names = {
@@ -254,9 +320,17 @@ def validate_insight_output(
         "coverage_notes": output.get("coverage_notes", {}),
     }
 
-    # Headline summary: word cap
-    if len(cleaned["headline_summary"].split()) > 30:
-        log["warnings"].append("headline_summary exceeded 22 words (soft cap)")
+    # Headline summary
+    if cleaned["headline_summary"]:
+        if len(cleaned["headline_summary"].split()) > _HEADLINE_WORD_CAP:
+            log["warnings"].append(
+                f"headline_summary exceeded {_HEADLINE_WORD_CAP} words"
+            )
+        un = _ungrounded_numbers(cleaned["headline_summary"], grounding)
+        if un:
+            log["warnings"].append({"field": "headline_summary", "ungrounded_numbers": un[:5]})
+    else:
+        log["errors"].append("headline_summary is missing or empty")
 
     # Insights
     seen_insight_ids: set[str] = set()
@@ -264,33 +338,40 @@ def validate_insight_output(
         if not isinstance(insight, dict):
             log["removed"].append({"kind": "insight", "index": i, "reason": "not a dict"})
             continue
-        bad_charts = [
+
+        # Hard reference checks
+        unknown_charts = [
             c for c in (insight.get("supporting_chart_ids") or [])
             if c not in valid_chart_ids
         ]
-        if bad_charts:
-            log["warnings"].append({"insight": insight.get("id"), "unknown_chart_ids": bad_charts})
-            insight["supporting_chart_ids"] = [
-                c for c in (insight.get("supporting_chart_ids") or []) if c in valid_chart_ids
-            ]
-        bad_kpis = [
+        unknown_kpis = [
             k for k in (insight.get("supporting_kpi_names") or [])
             if k not in valid_kpi_names
         ]
-        if bad_kpis:
-            log["warnings"].append({"insight": insight.get("id"), "unknown_kpis": bad_kpis})
+        if unknown_charts or unknown_kpis:
+            log["errors"].append({
+                "insight_index": i,
+                "insight_id": insight.get("id"),
+                "unknown_chart_ids": unknown_charts,
+                "unknown_kpi_names": unknown_kpis,
+            })
+            insight["supporting_chart_ids"] = [
+                c for c in (insight.get("supporting_chart_ids") or []) if c in valid_chart_ids
+            ]
             insight["supporting_kpi_names"] = [
                 k for k in (insight.get("supporting_kpi_names") or []) if k in valid_kpi_names
             ]
 
-        # Number grounding (soft)
-        body_numbers = _extract_numbers_from_text(insight.get("body", ""))
-        ungrounded = [n for n in body_numbers if n not in grounding and n not in {f"{round(float(g), 1)}" for g in grounding if g.replace('.', '', 1).replace('-', '', 1).isdigit()}]
-        if ungrounded:
-            log["warnings"].append({
-                "insight": insight.get("id"),
-                "ungrounded_numbers": ungrounded[:5],
-            })
+        # Number grounding across body + title
+        for field in ("body", "title"):
+            text = insight.get(field, "")
+            un = _ungrounded_numbers(text if isinstance(text, str) else "", grounding)
+            if un:
+                log["warnings"].append({
+                    "insight_index": i,
+                    "field": field,
+                    "ungrounded_numbers": un[:5],
+                })
 
         insight.setdefault("id", f"ins_{i + 1:03d}")
         if insight["id"] in seen_insight_ids:
@@ -298,12 +379,15 @@ def validate_insight_output(
         seen_insight_ids.add(insight["id"])
         cleaned["insights"].append(insight)
 
-    # Cap insights
-    if len(cleaned["insights"]) > 7:
-        log["warnings"].append("insights truncated to 7")
-        cleaned["insights"] = cleaned["insights"][:7]
+    if len(cleaned["insights"]) > _MAX_INSIGHTS:
+        log["warnings"].append(f"insights truncated to {_MAX_INSIGHTS}")
+        cleaned["insights"] = cleaned["insights"][:_MAX_INSIGHTS]
+    if len(cleaned["insights"]) < _MIN_INSIGHTS:
+        log["errors"].append(
+            f"expected ≥{_MIN_INSIGHTS} insights, got {len(cleaned['insights'])}"
+        )
 
-    # Recommendations: must link to existing insights
+    # Recommendations
     for i, rec in enumerate(output.get("strategic_recommendations", []) or []):
         if not isinstance(rec, dict):
             continue
@@ -312,28 +396,69 @@ def validate_insight_output(
             if link not in seen_insight_ids
         ]
         if bad_links:
-            log["warnings"].append({"rec": rec.get("id"), "unknown_insight_ids": bad_links})
+            log["errors"].append({
+                "rec_index": i,
+                "rec_id": rec.get("id"),
+                "unknown_insight_ids": bad_links,
+            })
             rec["linked_insight_ids"] = [
                 link for link in (rec.get("linked_insight_ids") or [])
                 if link in seen_insight_ids
             ]
+        # Number grounding on rec body
+        for field in ("body", "title"):
+            text = rec.get(field, "")
+            un = _ungrounded_numbers(text if isinstance(text, str) else "", grounding)
+            if un:
+                log["warnings"].append({
+                    "rec_index": i,
+                    "field": field,
+                    "ungrounded_numbers": un[:5],
+                })
         rec.setdefault("id", f"rec_{i + 1:03d}")
         cleaned["strategic_recommendations"].append(rec)
-    if len(cleaned["strategic_recommendations"]) > 5:
-        log["warnings"].append("recommendations truncated to 5")
-        cleaned["strategic_recommendations"] = cleaned["strategic_recommendations"][:5]
+    if len(cleaned["strategic_recommendations"]) > _MAX_RECS:
+        log["warnings"].append(f"recommendations truncated to {_MAX_RECS}")
+        cleaned["strategic_recommendations"] = cleaned["strategic_recommendations"][:_MAX_RECS]
+    if len(cleaned["strategic_recommendations"]) < _MIN_RECS:
+        log["errors"].append(
+            f"expected ≥{_MIN_RECS} recommendations, got {len(cleaned['strategic_recommendations'])}"
+        )
 
     # Data story
     story = output.get("data_story") or []
     if isinstance(story, list):
-        cleaned["data_story"] = [str(p).strip() for p in story if isinstance(p, str) and p.strip()][:5]
+        cleaned["data_story"] = [
+            str(p).strip() for p in story if isinstance(p, str) and p.strip()
+        ][:_MAX_STORY_PARAGRAPHS]
+        for j, paragraph in enumerate(cleaned["data_story"]):
+            un = _ungrounded_numbers(paragraph, grounding)
+            if un:
+                log["warnings"].append({
+                    "data_story_index": j,
+                    "ungrounded_numbers": un[:5],
+                })
 
     # Callouts
-    for callout in output.get("dashboard_callouts", []) or []:
-        if isinstance(callout, dict) and callout.get("chart_id") in valid_chart_ids:
-            cleaned["dashboard_callouts"].append(callout)
-    if len(cleaned["dashboard_callouts"]) > 4:
-        cleaned["dashboard_callouts"] = cleaned["dashboard_callouts"][:4]
+    for k, callout in enumerate(output.get("dashboard_callouts", []) or []):
+        if not isinstance(callout, dict):
+            continue
+        if callout.get("chart_id") not in valid_chart_ids:
+            log["errors"].append({
+                "callout_index": k,
+                "unknown_chart_id": callout.get("chart_id"),
+            })
+            continue
+        text = callout.get("body") or callout.get("text", "")
+        un = _ungrounded_numbers(text if isinstance(text, str) else "", grounding)
+        if un:
+            log["warnings"].append({
+                "callout_index": k,
+                "ungrounded_numbers": un[:5],
+            })
+        cleaned["dashboard_callouts"].append(callout)
+    if len(cleaned["dashboard_callouts"]) > _MAX_CALLOUTS:
+        cleaned["dashboard_callouts"] = cleaned["dashboard_callouts"][:_MAX_CALLOUTS]
 
     return cleaned, log
 
