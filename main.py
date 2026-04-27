@@ -27,7 +27,7 @@ from services.insight_engine import (
     inject_insights_into_dashboard,
 )
 from services.report_engine import build_report_summary
-from services.html_dashboard import write_html_dashboard
+from services.static_dashboard import render_static_dashboard
 from utils.json_utils import save_json
 
 
@@ -160,7 +160,7 @@ def run_pipeline(input_file: str, business_context: str = "auto", objective: str
     dashboard_data = inject_insights_into_dashboard(dashboard_data, insight_output)
     save_json(dashboard_data, output_dir / "09c_dashboard_data_with_insights.json")
 
-    write_html_dashboard(dashboard_data, output_dir / "10_dashboard_preview.html")
+    render_static_dashboard(dashboard_data, output_dir / "10_dashboard_preview.html")
 
     report_summary = build_report_summary(profile, safe_metadata, cleaning_log, transformation_log, kpi_results, dashboard_data)
     report_summary["dashboard_design_plan"] = dashboard_design_plan
