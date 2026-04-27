@@ -184,6 +184,36 @@ def _fallback_capabilities(metadata: dict[str, Any]) -> dict[str, bool]:
     }
 
 
+_DISTRIBUTION_FIELDS = (
+    "sample_values", "top_values", "multi_value",
+    "min", "max", "mean", "median", "min_date", "max_date",
+)
+
+# Substrings indicating a "price"-like name is actually text/metadata, not money.
+_TEXT_OVERRIDE_TOKENS = (
+    "color", "colour", "size", "currency", "shipping", "warranty",
+    "return", "availability", "merchant", "source", "url", "flavor",
+    "policy", "condition", "name",
+)
+
+
+def _carry_distribution_fields(target: dict[str, Any], source: dict[str, Any]) -> None:
+    """Copy distribution metadata (top values, samples, ranges) from source → target."""
+    for key in _DISTRIBUTION_FIELDS:
+        if source.get(key) is not None:
+            target[key] = source[key]
+
+
+def _looks_like_money(name: str, detected_type: str | None) -> bool:
+    """Money classification must respect detected_type AND text-override tokens."""
+    lower = name.lower()
+    if detected_type != "number":
+        return False
+    if any(tok in lower for tok in _TEXT_OVERRIDE_TOKENS):
+        return False
+    return any(key in lower for key in ["money", "amount", "sales", "revenue", "price", "cost", "salary"])
+
+
 def _fallback_column_semantics(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     """Create conservative semantic role guesses without a local LLM."""
     enhanced_columns = []
@@ -197,11 +227,11 @@ def _fallback_column_semantics(metadata: dict[str, Any]) -> list[dict[str, Any]]
         business_role = "unknown"
         confidence = 0.55
 
-        if any(key in lower for key in ["date", "time", "datetime", "created", "closed", "joined", "join"]):
+        if any(key in lower for key in ["date", "time", "datetime", "created", "closed", "joined", "join", "added", "updated"]):
             semantic_role = "date_or_timestamp"
             business_role = "time"
             confidence = 0.80
-        elif any(key in lower for key in ["money", "amount", "sales", "revenue", "price", "cost", "salary"]):
+        elif _looks_like_money(name, detected_type):
             semantic_role = "financial_amount"
             business_role = "measure"
             confidence = 0.82
@@ -209,6 +239,22 @@ def _fallback_column_semantics(metadata: dict[str, Any]) -> list[dict[str, Any]]
             semantic_role = "quantity"
             business_role = "measure"
             confidence = 0.82
+        elif role_guess in ("color",) or any(key in lower for key in ["color", "colour"]):
+            semantic_role = "categorical_dimension"
+            business_role = "dimension"
+            confidence = 0.82
+        elif role_guess in ("brand",):
+            semantic_role = "brand_or_manufacturer"
+            business_role = "dimension"
+            confidence = 0.82
+        elif role_guess in ("category",) or "categor" in lower:
+            semantic_role = "business_category"
+            business_role = "dimension"
+            confidence = 0.82
+        elif role_guess in ("multi_value_list",):
+            semantic_role = "multi_value_list"
+            business_role = "dimension"
+            confidence = 0.78
         elif any(key in lower for key in ["product", "item", "coffee", "sku"]):
             semantic_role = "product_or_item"
             business_role = "dimension"
@@ -221,7 +267,7 @@ def _fallback_column_semantics(metadata: dict[str, Any]) -> list[dict[str, Any]]
             semantic_role = "location"
             business_role = "dimension"
             confidence = 0.78
-        elif any(key in lower for key in ["department", "status", "category", "supplier"]):
+        elif any(key in lower for key in ["department", "status", "supplier"]):
             semantic_role = "business_category"
             business_role = "dimension"
             confidence = 0.75
@@ -234,7 +280,7 @@ def _fallback_column_semantics(metadata: dict[str, Any]) -> list[dict[str, Any]]
             business_role = "dimension"
             confidence = 0.65
 
-        enhanced_columns.append({
+        out = {
             "name": name,
             "detected_type": detected_type,
             "missing_percent": col.get("missing_percent"),
@@ -244,7 +290,9 @@ def _fallback_column_semantics(metadata: dict[str, Any]) -> list[dict[str, Any]]
             "business_role": business_role,
             "confidence": confidence,
             "safe_to_send": True,
-        })
+        }
+        _carry_distribution_fields(out, col)
+        enhanced_columns.append(out)
 
     return enhanced_columns
 
@@ -286,8 +334,36 @@ def _correct_semantic_role(
     lower = name.lower()
     allowed_business_roles = {"measure", "dimension", "time", "identifier", "status", "text", "unknown"}
 
-    if any(key in lower for key in ["date", "time", "datetime", "created", "closed", "joined", "join"]):
+    if any(key in lower for key in ["date", "time", "datetime", "created", "closed", "joined", "join", "added", "updated"]):
         return "date_or_timestamp", "time", 0.90
+
+    # Date/recency derived columns (e.g., product_update_age_days, *_recency_days).
+    if any(key in lower for key in ["age_days", "recency_days", "days_to_", "days_between", "_to_", "tenure_days", "tenure_years"]) and detected_type == "number":
+        return "duration_days", "measure", 0.85
+
+    # Bucket dimensions (e.g., update_recency_bucket, days_*_bucket, price_tier).
+    if "_bucket" in lower or lower == "price_tier":
+        return "categorical_bucket", "dimension", 0.88
+
+    # Boolean cohort flags (was_*_changed, has_*, is_*_flag).
+    if lower.startswith(("was_", "has_", "is_")) or lower.endswith(("_flag",)):
+        return "boolean_flag", "dimension", 0.85
+
+    # Multi-value explosion outputs.
+    if lower.endswith("_primary"):
+        return "categorical_dimension", "dimension", 0.88
+    if lower.endswith("_count") and detected_type == "number":
+        return "numeric_measure", "measure", 0.80
+
+    if role_guess == "color" or any(key in lower for key in ["color", "colour"]):
+        # Trust profiler's color guess; never let "price_color" be money.
+        return "categorical_dimension", "dimension", 0.85
+
+    if role_guess == "brand" or "brand" in lower or "manufacturer" in lower:
+        return "brand_or_manufacturer", "dimension", 0.88
+
+    if role_guess == "multi_value_list":
+        return "multi_value_list", "dimension", 0.82
 
     if any(key in lower for key in ["coffee", "product", "item", "sku", "menu"]):
         return "product_name", "dimension", 0.90
@@ -295,10 +371,10 @@ def _correct_semantic_role(
     if any(key in lower for key in ["cash", "payment", "card", "method", "type"]):
         return "payment_method", "dimension", 0.88
 
-    if any(key in lower for key in ["money", "amount", "sales", "revenue", "price", "cost", "salary"]):
+    if _looks_like_money(name, detected_type):
         return "financial_amount", "measure", 0.90
 
-    if any(key in lower for key in ["qty", "quantity", "units", "stock", "count"]):
+    if any(key in lower for key in ["qty", "quantity", "units", "stock"]):
         return "quantity", "measure", 0.88
 
     if any(key in lower for key in ["region", "city", "country", "branch", "location"]):
@@ -348,7 +424,7 @@ def _normalize_ollama_columns(ai_columns: list[dict[str, Any]], metadata: dict[s
             ai_business=ai_business,
         )
 
-        normalized.append({
+        out = {
             "name": name,
             "detected_type": detected_type,
             "missing_percent": original.get("missing_percent"),
@@ -358,7 +434,9 @@ def _normalize_ollama_columns(ai_columns: list[dict[str, Any]], metadata: dict[s
             "business_role": business_role,
             "confidence": confidence,
             "safe_to_send": bool(item.get("safe_to_send", True)),
-        })
+        }
+        _carry_distribution_fields(out, original)
+        normalized.append(out)
 
     return normalized
 
