@@ -267,8 +267,11 @@ def calculate_kpis(df: pd.DataFrame, suggestions: dict):
             if not primary_date_column:
                 return None, None
             # `count_rows` has no value column — bucket by row count.
+            # `count_non_null` needs the dedicated per-bucket non-null count
+            # (NOT a sum of values — that would compute the wrong KPI).
             agg = "count" if formula == "count_rows" else (
-                "sum" if formula in {"sum", "count_non_null"} else
+                "count_non_null" if formula == "count_non_null" else
+                "sum" if formula == "sum" else
                 "average" if formula == "average" else
                 formula  # min / max
             )

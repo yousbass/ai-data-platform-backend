@@ -205,9 +205,11 @@ def aggregate_by_grain(
     Always returns a list of `{date, value, count}` records sorted by date
     ascending. Rows with NaT in `date_column` are dropped (they cannot be
     placed on a time axis). Aggregations supported: sum, average, median,
-    min, max, count.
+    min, max, count, count_non_null.
 
     `value_column=None` is allowed only when `aggregation == "count"`.
+    `count_non_null` requires a `value_column` and emits the per-bucket
+    count of rows where that column is non-null (and date is valid).
     """
     if grain not in ALL_GRAINS:
         raise ValueError(f"Unsupported grain: {grain!r}")
@@ -249,6 +251,11 @@ def aggregate_by_grain(
         agg = grouper["_value"].min()
     elif aggregation == "max":
         agg = grouper["_value"].max()
+    elif aggregation == "count_non_null":
+        # Per-bucket count of non-null values (rows with valid date AND value).
+        # Bucket value == bucket count so the frontend's "sum" reducer adds
+        # them correctly when scoping by date range.
+        agg = grouper.size()
     else:
         raise ValueError(f"Unsupported aggregation: {aggregation!r}")
 
