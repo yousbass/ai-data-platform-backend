@@ -136,6 +136,9 @@ def _make_insights(dashboard: dict[str, Any]) -> list[str]:
 
 def build_dashboard_data(kpi_suggestions, kpi_results):
     chart_metadata = kpi_results.get("chart_metadata", {})
+    data_by_grain_map = kpi_results.get("data_by_grain", {}) or {}
+    temporal_manifest = kpi_results.get("temporal_manifest")
+
     dashboard = {
         "title": "Executive Analytics Dashboard",
         "subtitle": "Auto-generated from cleaned and enriched data",
@@ -144,6 +147,12 @@ def build_dashboard_data(kpi_suggestions, kpi_results):
         "filters": kpi_suggestions.get("dashboard_layout", {}).get("filters", []),
         "future_opportunities": kpi_results.get("future_opportunities", kpi_suggestions.get("future_opportunities", [])),
     }
+
+    # Attach the temporal manifest at the top level. The frontend's
+    # TimeScopeContext reads this to set up the global Day/Month/Year toggle
+    # and the date-range slider. When None, the UI hides temporal controls.
+    if temporal_manifest:
+        dashboard["temporal"] = temporal_manifest
 
     grouped = kpi_results.get("grouped_results", {})
 
@@ -159,7 +168,7 @@ def build_dashboard_data(kpi_suggestions, kpi_results):
         x_field = _infer_x_field(kpi, chart_meta)
         y_field = _infer_y_field(formula_type, kpi, chart_meta)
 
-        dashboard["charts"].append({
+        chart_obj: dict[str, Any] = {
             "title": name,
             "type": chart_type,
             "visual": visual,
@@ -172,7 +181,22 @@ def build_dashboard_data(kpi_suggestions, kpi_results):
             "value_field": chart_meta.get("value_field"),
             "data": grouped[name],
             "metadata": chart_meta,
-        })
+        }
+
+        # Time-series charts: replace the default `data` with the bucket
+        # series at the dashboard's default grain so the initial paint is
+        # already date-bucketed (no raw timestamps), and ship `data_by_grain`
+        # so the user can toggle Day / Month / Year client-side.
+        if name in data_by_grain_map and temporal_manifest:
+            data_by_grain = data_by_grain_map[name]
+            default_grain = temporal_manifest.get("default_grain", "month")
+            chart_obj["is_temporal"] = True
+            chart_obj["data_by_grain"] = data_by_grain
+            chart_obj["x_field"] = "date"
+            chart_obj["y_field"] = "value"
+            chart_obj["data"] = data_by_grain.get(default_grain, []) or chart_obj["data"]
+
+        dashboard["charts"].append(chart_obj)
 
     dashboard["insights"] = _make_insights(dashboard)
     return dashboard
