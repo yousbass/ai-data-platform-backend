@@ -80,7 +80,10 @@ def render_static_dashboard(dashboard_data: dict, output_path: str | Path) -> Pa
 
     template = _TEMPLATE_PATH.read_text(encoding="utf-8")
     encoded = _safe_json(dashboard_data)
-    replaced, count = _PLACEHOLDER_RE.subn(encoded, template, count=1)
+    # NB: passing a lambda (not a string) bypasses re.sub's replacement-template
+    # parser, which would otherwise interpret backslash sequences inside the
+    # JSON-escaped payload (e.g. \u003c) as backrefs and raise `bad escape \\u`.
+    replaced, count = _PLACEHOLDER_RE.subn(lambda _m: encoded, template, count=1)
     if count != 1:
         raise RuntimeError(
             "Could not locate the __DASHBOARD_DATA_PLACEHOLDER__ block in the "
