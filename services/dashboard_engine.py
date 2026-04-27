@@ -93,6 +93,14 @@ def _infer_x_field(kpi: dict[str, Any], chart_meta: dict[str, Any] | None) -> st
 
 
 def _make_insights(dashboard: dict[str, Any]) -> list[str]:
+    """
+    Mechanical fallback insights derived from the dashboard data itself.
+
+    This is a *fallback* used only when Smart AI #4 (the Dashboard Insight Writer)
+    is unavailable or fails validation. When the Insight Writer runs successfully,
+    services/insight_engine.inject_insights_into_dashboard() overwrites the result
+    of this function with the AI-authored insights.
+    """
     insights: list[str] = []
 
     for chart in dashboard.get("charts", []):
