@@ -536,6 +536,19 @@ def _build_required_chart_coverage(metadata: dict) -> str:
         )
 
     bucket_cols = [name for name in column_names if name.endswith("_bucket")]
+    # Prefer cohort-spread buckets (`days_<a>_to_<b>_bucket`) over recency
+    # buckets when both exist: the spread between two dates almost always has
+    # more variation than today-vs-most-recent (which collapses to a single
+    # bucket on historical-only datasets).
+    bucket_cols.sort(
+        key=lambda b: (
+            0 if b.startswith("days_") and b.endswith("_bucket") else
+            1 if b == "price_tier" else
+            2 if b.endswith("_recency_bucket") else
+            3,
+            b,
+        )
+    )
     if bucket_cols:
         bucket = bucket_cols[0]
         requirements.append(
@@ -665,6 +678,21 @@ CROSS-DIMENSIONAL CHARTS (use formula_type=heatmap):
 - When a brand dimension and a month derived column both exist, propose at least one heatmap with
   x_column=month, y_column=brand, value_column=count. This shows brand activity over time.
 - When a category dimension and a month/year column both exist, the same applies for category-over-time.
+- A 2D heatmap REQUIRES `formula_type=heatmap` with explicit `x_column` AND `y_column`. NEVER
+  combine `formula_type=group_count` with `visual=heatmap` — group_count yields one dimension only,
+  so the chart would render as a single column of bars and the validator will downgrade it to a bar_chart.
+
+CHART-DIMENSION RULES (MANDATORY — the validator enforces these and will REJECT or REWRITE violations):
+- NEVER use a unique-identifier column (`*_id`, `*_record_id`, `asin`, `sku`, `upc`, `ean`, `isbn`,
+  `uuid`, or any column where almost every value is unique) as the `group_by` of a `group_count` KPI.
+  The chart would have hundreds of raw IDs on the x-axis. If you want to count unique items, use
+  `formula_type=count_distinct` with `column=<id_column>` and `visual=kpi_card` ("Unique Products").
+- NEVER pick a `group_by` column that has fewer than 2 distinct values (single-bucket charts are useless).
+  When several `*_bucket` candidates exist, prefer the one most likely to have spread (e.g. `days_*_to_*_bucket`
+  over `*_recency_bucket` for historical datasets where everything would collapse to a single staleness bucket).
+- For "share / rate / percent / on-sale" KPIs computed as `average` of a 0/1 boolean flag column
+  (`is_*`, `*_flag`), the value will be in [0,1]. The local engine will format it as a percentage
+  automatically based on the KPI name and column name; you do not need to do anything special.
 {required_coverage}{force_block}
 Safe enriched metadata:
 {json.dumps(metadata, indent=2, ensure_ascii=False)}
