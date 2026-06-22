@@ -74,6 +74,48 @@ def _limit_grouped(grouped: pd.DataFrame, sort_column: str, visual: str | None, 
     return grouped
 
 
+_SHARE_NAME_TOKENS = ("share", "rate", "percent", "ratio", " pct", "%", "on-sale", "on sale")
+_SHARE_COL_PREFIXES = ("is_", "has_")
+_SHARE_COL_SUFFIXES = ("_flag", "_share", "_rate", "_pct", "_percent", "_ratio")
+
+
+def _infer_card_format(
+    kpi_name: str | None,
+    value_column: str | None,
+    value: Any,
+    current_format: str,
+) -> tuple[str, Any]:
+    """
+    When the AI emits the default `format=number` for a card whose name or
+    source column screams "this is a share/rate/percentage" (e.g. an
+    `average` of an `is_*` boolean flag), the frontend would render the
+    raw 0.335 as "0" because the number formatter strips decimals.
+
+    Detect that case and convert: format=percent, value scaled to a 0-100
+    display value (so 0.335 → 33.5, which the frontend's formatPercent
+    renders as "33.5%").
+    """
+    if current_format != "number":
+        return current_format, value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return current_format, value
+    name_l = (kpi_name or "").lower()
+    col_l = (value_column or "").lower()
+    is_share_name = any(token in name_l for token in _SHARE_NAME_TOKENS)
+    is_share_col = (
+        any(col_l.startswith(p) for p in _SHARE_COL_PREFIXES)
+        or any(col_l.endswith(s) for s in _SHARE_COL_SUFFIXES)
+    )
+    if not (is_share_name or is_share_col):
+        return current_format, value
+    fvalue = float(value)
+    if 0 <= fvalue <= 1:
+        return "percent", round(fvalue * 100, 2)
+    if 0 <= fvalue <= 100:
+        return "percent", round(fvalue, 2)
+    return current_format, value
+
+
 def _add_card(
     results: dict,
     name: str,
@@ -89,6 +131,7 @@ def _add_card(
     supplied, the frontend can recompute the card's value for any date range
     by aggregating the per-bucket series client-side.
     """
+    value_format, value = _infer_card_format(name, value_column, value, value_format)
     card: dict[str, Any] = {
         "title": name,
         "value": value,

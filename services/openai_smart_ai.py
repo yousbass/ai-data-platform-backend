@@ -351,14 +351,137 @@ def _extract_json(text: str) -> Dict[str, Any]:
         raise SmartAIError(f"AI response did not contain valid JSON: {text[:500]}")
 
 
-def _call_openai_json(prompt: str) -> Dict[str, Any]:
+def _call_openai_json(
+    prompt: str,
+    schema: Dict[str, Any] | None = None,
+    schema_name: str = "smart_ai_response",
+) -> Dict[str, Any]:
+    """
+    Call the OpenAI Responses API and parse the result as JSON.
+
+    When `schema` is provided, the call uses OpenAI's structured-output / JSON
+    schema mode (strict=True). This forces the model to emit every field in the
+    schema — including fields that would otherwise be silently dropped (such as
+    `x_column` / `y_column` / `value_column` on heatmap KPIs). Without a schema
+    we fall back to free-form JSON parsing for backwards compatibility.
+    """
     client = _client()
-    response = client.responses.create(
-        model=DEFAULT_MODEL,
-        input=prompt,
-        prompt_cache_retention="24h",
-    )
+    kwargs: Dict[str, Any] = {
+        "model": DEFAULT_MODEL,
+        "input": prompt,
+        "prompt_cache_retention": "24h",
+    }
+    if schema is not None:
+        kwargs["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "schema": schema,
+                "strict": True,
+            }
+        }
+    response = client.responses.create(**kwargs)
     return _extract_json(response.output_text)
+
+
+# JSON schema used by `get_kpi_dashboard_suggestions` to force the model to
+# populate every KPI field — most importantly `x_column`, `y_column`, and
+# `value_column` on heatmap KPIs, which previously came back as null with the
+# real column names buried in `reason`. With strict structured outputs the
+# model cannot omit these properties; combined with the prompt rule below
+# ("when formula_type='heatmap' you MUST set x_column, y_column, value_column
+# to actual columns"), this removes the need for `_recover_heatmap_fields` to
+# do any real work.
+KPI_SUGGESTIONS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "kpis": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "formula_type": {
+                        "type": "string",
+                        "enum": [
+                            "sum",
+                            "average",
+                            "count_rows",
+                            "count_distinct",
+                            "group_sum",
+                            "group_average",
+                            "group_count",
+                            "heatmap",
+                            "histogram",
+                            "scatter",
+                        ],
+                    },
+                    "column": {"type": ["string", "null"]},
+                    "group_by": {"type": ["string", "null"]},
+                    "value_column": {"type": ["string", "null"]},
+                    "x_column": {"type": ["string", "null"]},
+                    "y_column": {"type": ["string", "null"]},
+                    "visual": {"type": "string"},
+                    "priority": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": [
+                    "name",
+                    "formula_type",
+                    "column",
+                    "group_by",
+                    "value_column",
+                    "x_column",
+                    "y_column",
+                    "visual",
+                    "priority",
+                    "reason",
+                ],
+            },
+        },
+        "dashboard_layout": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "top": {"type": "array", "items": {"type": "string"}},
+                "middle": {"type": "array", "items": {"type": "string"}},
+                "bottom": {"type": "array", "items": {"type": "string"}},
+                "filters": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["top", "middle", "bottom", "filters"],
+        },
+        "future_opportunities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {"type": "string"},
+                    "required_columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "why_useful": {"type": "string"},
+                    "implementation_note": {"type": "string"},
+                },
+                "required": [
+                    "name",
+                    "type",
+                    "required_columns",
+                    "why_useful",
+                    "implementation_note",
+                ],
+            },
+        },
+    },
+    "required": ["kpis", "dashboard_layout", "future_opportunities"],
+}
 
 
 def _call_openai_text(prompt: str) -> str:
@@ -536,6 +659,19 @@ def _build_required_chart_coverage(metadata: dict) -> str:
         )
 
     bucket_cols = [name for name in column_names if name.endswith("_bucket")]
+    # Prefer cohort-spread buckets (`days_<a>_to_<b>_bucket`) over recency
+    # buckets when both exist: the spread between two dates almost always has
+    # more variation than today-vs-most-recent (which collapses to a single
+    # bucket on historical-only datasets).
+    bucket_cols.sort(
+        key=lambda b: (
+            0 if b.startswith("days_") and b.endswith("_bucket") else
+            1 if b == "price_tier" else
+            2 if b.endswith("_recency_bucket") else
+            3,
+            b,
+        )
+    )
     if bucket_cols:
         bucket = bucket_cols[0]
         requirements.append(
@@ -622,9 +758,17 @@ Supported formula_type values:
 - sum: requires "column".
 - average: requires "column".
 - count_rows: does not require a column.
+- count_distinct: requires "column" (renders as a kpi_card).
 - group_sum: requires "group_by" and "value_column".
 - group_average: requires "group_by" and "value_column".
 - group_count: requires "group_by".
+- heatmap: requires "x_column", "y_column", AND "value_column" (set value_column
+  to "count" when the cell value should be a row count, otherwise to a numeric
+  column name). NEVER leave x_column / y_column / value_column as null on a
+  heatmap — they are the chart's two axes and its cell metric. Embedding the
+  column names only inside `reason` is treated as a hard failure.
+- histogram: requires "column" (numeric).
+- scatter: requires "x_column" and "y_column" (both numeric).
 
 Supported visual values (use the chart type that best fits the data shape — the full set is intentionally broad):
 - kpi_card           — single headline numbers
@@ -665,22 +809,70 @@ CROSS-DIMENSIONAL CHARTS (use formula_type=heatmap):
 - When a brand dimension and a month derived column both exist, propose at least one heatmap with
   x_column=month, y_column=brand, value_column=count. This shows brand activity over time.
 - When a category dimension and a month/year column both exist, the same applies for category-over-time.
+- A 2D heatmap REQUIRES `formula_type=heatmap` with explicit `x_column` AND `y_column`. NEVER
+  combine `formula_type=group_count` with `visual=heatmap` — group_count yields one dimension only,
+  so the chart would render as a single column of bars and the validator will downgrade it to a bar_chart.
+
+CHART-DIMENSION RULES (MANDATORY — the validator enforces these and will REJECT or REWRITE violations):
+- NEVER use a unique-identifier column (`*_id`, `*_record_id`, `asin`, `sku`, `upc`, `ean`, `isbn`,
+  `uuid`, or any column where almost every value is unique) as the `group_by` of a `group_count` KPI.
+  The chart would have hundreds of raw IDs on the x-axis. If you want to count unique items, use
+  `formula_type=count_distinct` with `column=<id_column>` and `visual=kpi_card` ("Unique Products").
+- NEVER pick a `group_by` column that has fewer than 2 distinct values (single-bucket charts are useless).
+  When several `*_bucket` candidates exist, prefer the one most likely to have spread (e.g. `days_*_to_*_bucket`
+  over `*_recency_bucket` for historical datasets where everything would collapse to a single staleness bucket).
+- For "share / rate / percent / on-sale" KPIs computed as `average` of a 0/1 boolean flag column
+  (`is_*`, `*_flag`), the value will be in [0,1]. The local engine will format it as a percentage
+  automatically based on the KPI name and column name; you do not need to do anything special.
 {required_coverage}{force_block}
 Safe enriched metadata:
 {json.dumps(metadata, indent=2, ensure_ascii=False)}
 
-Return JSON using exactly this structure:
+Return JSON using exactly this structure. Every KPI MUST include all of
+`name`, `formula_type`, `column`, `group_by`, `value_column`, `x_column`,
+`y_column`, `visual`, `priority`, `reason`. Use `null` for fields that
+genuinely do not apply to a given KPI — but for `formula_type="heatmap"`,
+`x_column`, `y_column`, and `value_column` MUST be populated with real
+column names (or `"count"` for `value_column`). Do NOT bury the heatmap
+axes inside `reason` text only.
+
 {{
   "kpis": [
     {{
-      "name": "KPI name",
-      "formula_type": "sum | average | count_rows | group_sum | group_average | group_count",
-      "column": "column name if needed",
-      "group_by": "grouping column if needed",
-      "value_column": "value column if needed",
-      "visual": "one of the supported visual values listed above",
-      "priority": "high | medium | low",
-      "reason": "short reason"
+      "name": "Total Revenue",
+      "formula_type": "sum",
+      "column": "revenue",
+      "group_by": null,
+      "value_column": null,
+      "x_column": null,
+      "y_column": null,
+      "visual": "kpi_card",
+      "priority": "high",
+      "reason": "Headline revenue figure for the executive overview."
+    }},
+    {{
+      "name": "Top Brands by Listing Count",
+      "formula_type": "group_count",
+      "column": null,
+      "group_by": "brand_normalized",
+      "value_column": null,
+      "x_column": null,
+      "y_column": null,
+      "visual": "horizontal_bar_chart",
+      "priority": "high",
+      "reason": "Ranks the brands that dominate the catalog."
+    }},
+    {{
+      "name": "Brand Activity by Month",
+      "formula_type": "heatmap",
+      "column": null,
+      "group_by": null,
+      "value_column": "count",
+      "x_column": "product_added_month",
+      "y_column": "brand_normalized",
+      "visual": "heatmap",
+      "priority": "medium",
+      "reason": "Shows when each top brand was most active in the catalog."
     }}
   ],
   "dashboard_layout": {{
@@ -699,12 +891,39 @@ Return JSON using exactly this structure:
     }}
   ]
 }}
+
+The three KPI examples above are illustrative of the shape only — replace them
+with KPIs derived from the actual safe metadata. The heatmap example shows the
+mandatory pattern: every heatmap KPI MUST have `x_column`, `y_column`, and
+`value_column` set to actual column names from the metadata.
 """
-    data = _call_openai_json(prompt)
+    data = _call_openai_json(
+        prompt,
+        schema=KPI_SUGGESTIONS_SCHEMA,
+        schema_name="kpi_dashboard_suggestions",
+    )
     data.setdefault("kpis", [])
     data.setdefault("dashboard_layout", {"top": [], "middle": [], "bottom": [], "filters": []})
     data.setdefault("future_opportunities", [])
+    data["kpis"] = _recover_heatmap_fields(data["kpis"])
     return data
+
+
+def _recover_heatmap_fields(kpis: list) -> list:
+    """
+    Defensive no-op recovery layer for heatmap KPIs.
+
+    Historically the model emitted `formula_type="heatmap"` with
+    `x_column` / `y_column` / `value_column` all set to null and the real
+    column names embedded only in the `reason` text. The KPI prompt now lists
+    these fields as mandatory and the call uses OpenAI's structured-output
+    (JSON schema) mode, so the model populates them directly and this layer
+    has nothing left to recover.
+
+    The function is kept as a defensive no-op so callers and tests continue
+    to import it. It returns the input list unchanged.
+    """
+    return kpis
 
 
 def generate_dashboard_design_plan(metadata: dict, kpi_suggestions: dict, dashboard_data: dict) -> dict:

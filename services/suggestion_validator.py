@@ -123,6 +123,39 @@ def _column_exists(df: pd.DataFrame, column: Any) -> bool:
     return isinstance(column, str) and column in df.columns
 
 
+# ---------------------------------------------------------------------------
+# Identifier-column detection
+# ---------------------------------------------------------------------------
+# A `group_count` over a unique-identifier column (e.g. `product_record_id`,
+# `asin`, `sku`, `uuid`) renders as an unreadable bar chart with hundreds of
+# raw IDs on the x-axis. We detect these and convert them to a `count_distinct`
+# headline card instead, which is what the AI almost always meant.
+_IDENTIFIER_NAME_PATTERN = re.compile(
+    r"(^|_)(id|record_id|asin|sku|upc|ean|isbn|guid|uuid|websiteid|vin|hash)$"
+    r"|(_id$)"
+    r"|(_record_id$)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_identifier(df: pd.DataFrame, column: str) -> bool:
+    """
+    Heuristic: column is a unique-row identifier and should NOT be used as a
+    chart dimension. True when EITHER the name matches an id-like pattern OR
+    the column has very high uniqueness ratio on a non-trivial dataset.
+    """
+    if column not in df.columns:
+        return False
+    name = column.lower() if isinstance(column, str) else ""
+    if name and _IDENTIFIER_NAME_PATTERN.search(name):
+        return True
+    n = len(df)
+    if n < 20:
+        return False
+    nunique = int(df[column].nunique(dropna=True))
+    return (nunique / n) >= 0.8 and nunique > 50
+
+
 def validate_schema_suggestions(df: pd.DataFrame, suggestions: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Validate schema suggestions before local transformation.
@@ -322,7 +355,20 @@ def validate_kpi_suggestions(df: pd.DataFrame, suggestions: Dict[str, Any]) -> T
             if not _is_numeric_column(df, value_column):
                 log["kpi_validation"]["rejected_kpis"].append({"suggestion": kpi, "reason": f"{formula_type} requires a numeric value_column."})
                 continue
-            if visual not in CATEGORY_VISUALS | {"line_chart", "area_chart", "heatmap"}:
+            # Bug B (extended) — heatmap with one dimension: grouped numeric
+            # KPIs only have a single `group_by` dimension, so a heatmap is
+            # always malformed (it needs x AND y). Downgrade to bar_chart.
+            # True 2D heatmaps must use formula_type=heatmap with explicit
+            # x_column and y_column.
+            if visual == "heatmap":
+                kpi = dict(kpi)
+                kpi["visual"] = "bar_chart"
+                kpi["validation_note"] = (
+                    f"Downgraded heatmap → bar_chart: {formula_type} produces a single dimension. "
+                    "For a true 2D heatmap, use formula_type=heatmap with x_column and y_column."
+                )
+                visual = "bar_chart"
+            if visual not in CATEGORY_VISUALS | {"line_chart", "area_chart"}:
                 kpi = dict(kpi)
                 kpi["visual"] = "bar_chart"
             if kpi.get("visual") in {"pie_chart", "donut_chart"} and _is_high_cardinality(df, group_by, threshold=6):
@@ -335,6 +381,50 @@ def validate_kpi_suggestions(df: pd.DataFrame, suggestions: Dict[str, Any]) -> T
             if not _column_exists(df, group_by):
                 log["kpi_validation"]["rejected_kpis"].append({"suggestion": kpi, "reason": "group_by column does not exist."})
                 continue
+            # Bug A — identifier x-axis: a `group_count` over a unique row-id
+            # column would render as hundreds of raw IDs. Convert to a
+            # `count_distinct` headline card, which is what the AI usually
+            # meant ("Unique X" / "Distinct X").
+            if _looks_like_identifier(df, group_by):
+                kpi = dict(kpi)
+                kpi["formula_type"] = "count_distinct"
+                kpi["column"] = group_by
+                kpi.pop("group_by", None)
+                kpi["visual"] = "kpi_card"
+                kpi["validation_note"] = (
+                    f"Converted group_count to count_distinct: `{group_by}` looks like a unique "
+                    f"identifier (id-like name or ≥80% unique). Bar chart would have been "
+                    f"unreadable; a headline `Distinct {group_by}` card is what the user wants."
+                )
+                validated_kpis.append(kpi)
+                accepted_names.add(name)
+                log["kpi_validation"]["accepted_kpis"].append(kpi)
+                continue
+            # Bug C — single-bucket dimension: a group_count over a column
+            # with only 1 distinct value renders as a useless 1-bar chart
+            # (e.g. all rows fall into "Very stale (2+ years)").
+            nunique = int(df[group_by].nunique(dropna=True))
+            if nunique < 2:
+                log["kpi_validation"]["rejected_kpis"].append({
+                    "suggestion": kpi,
+                    "reason": (
+                        f"group_by `{group_by}` has only {nunique} distinct value(s) — "
+                        f"chart would be a single bar with no comparison."
+                    ),
+                })
+                continue
+            # Bug B — heatmap with one dimension: `group_count + visual=heatmap`
+            # is malformed (heatmaps need x AND y). Downgrade to bar_chart so
+            # the chart still renders meaningfully. True 2D heatmaps must use
+            # `formula_type=heatmap` with explicit x_column and y_column.
+            if visual == "heatmap":
+                kpi = dict(kpi)
+                kpi["visual"] = "bar_chart"
+                kpi["validation_note"] = (
+                    "Downgraded heatmap → bar_chart: group_count produces a single dimension. "
+                    "For a true 2D heatmap, use formula_type=heatmap with x_column and y_column."
+                )
+                visual = "bar_chart"
             if visual not in CATEGORY_VISUALS | {"heatmap"}:
                 kpi = dict(kpi)
                 kpi["visual"] = "bar_chart"
